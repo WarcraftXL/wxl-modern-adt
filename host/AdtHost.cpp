@@ -20,6 +20,7 @@
 
 #include "../shared/AdtMerge.hpp"
 #include "../shared/WdtFixup.hpp"
+#include "../shared/WdlFixup.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -129,6 +130,18 @@ namespace
         return ok;
     }
 
+    // Reshape a modern low-detail map index (.wdl) to the Client layout. Returns false (serve raw) for a
+    // tile index that is already Client-shaped.
+    bool TransformWdl(std::string_view name, std::span<const uint8_t> raw, std::vector<uint8_t>& out)
+    {
+        if (!EndsWithCI(name, ".wdl")) return false;
+        const bool ok = madt::FixWdl(raw, out);
+        if (ok)
+            wxl::core::log::Printf("modern-wdl: %.*s reshaped (%u -> %u bytes)",
+                int(name.size()), name.data(), uint32_t(raw.size()), uint32_t(out.size()));
+        return ok;
+    }
+
     // File-scope registrar: self-registers the transforms before the host serve loop starts.
     struct Registrar
     {
@@ -136,6 +149,7 @@ namespace
         {
             wxl::host::RegisterTransform("modern-adt", &TransformAdt);
             wxl::host::RegisterTransform("modern-wdt", &TransformWdt);
+            wxl::host::RegisterTransform("modern-wdl", &TransformWdl);
         }
     } g_registrar;
 }

@@ -224,7 +224,7 @@ namespace wxl::modern::adt
         }
 
         // Assemble one monolithic MCNK from the three split pieces; fill mcin[id] with its file offset + size.
-        int buildMcnk(Out& o, int id,  const uint8_t* rb, uint32_t rOff, uint32_t rLen, const uint8_t* tb, uint32_t tOff, uint32_t tLen, const uint8_t* ob, uint32_t oOff, uint32_t oLen, uint32_t mcin[256][2])
+        void buildMcnk(Out& o, int id,  const uint8_t* rb, uint32_t rOff, uint32_t rLen, const uint8_t* tb, uint32_t tOff, uint32_t tLen, const uint8_t* ob, uint32_t oOff, uint32_t oLen, uint32_t mcin[256][2])
         {
             const uint32_t start = o.tell();
             o.u32(MCNK);
@@ -251,22 +251,18 @@ namespace wxl::modern::adt
                 o.u32(MCNR); o.u32(435); o.raw(nrm, 448);
             }
 
-            // MCLY (tex0). Carry every layer physically, but cap the header layer count at 4. The native
-            // terrain build materializes only header.nLayers texture records into a 4-slot array, so a count
-            // above 4 overflows it; the MCLY/MCAL sub-chunks themselves are walked by size and the tail past
-            // 4 is left untouched by the native build. Layers 4..N ride along for the runtime multi-pass to
-            // bind and draw as extra passes. The first 4 entries + their alpha stay byte-identical.
-            uint32_t ofsMCLY = 0; int nLayer = 0, rawLayers = 0;
+            // MCLY (tex0). Clamp to 4 layers: the Client's terrain build materializes only header.nLayers
+            // texture records into a fixed 4-slot array, so a higher count overflows it.
+            uint32_t ofsMCLY = 0; int nLayer = 0;
             std::vector<uint8_t> newMcal; // re-packed alpha maps (2048 bytes per use-alpha layer, contiguous)
             uint32_t mcalOff = 0, mcalSz = 0; const uint8_t* mcalBase = nullptr;
             if (tb && sub(tb, tOff, tLen, MCAL, mcalOff, mcalSz)) mcalBase = tb + mcalOff;
             if (tb && sub(tb, tOff, tLen, MCLY, d, s))
             {
-                int layers = int(s / 0x10);
-                rawLayers = layers;
+                int layers = int(s / 0x10), keep = layers > 4 ? 4 : layers;
                 ofsMCLY = o.tell() - start;
-                o.u32(MCLY); o.u32(uint32_t(layers * 0x10));
-                for (int i = 0; i < layers; ++i)
+                o.u32(MCLY); o.u32(uint32_t(keep * 0x10));
+                for (int i = 0; i < keep; ++i)
                 {
                     const uint8_t* L = tb + d + i*0x10;
                     const uint32_t flags = rd32(L+0x04);
@@ -286,7 +282,7 @@ namespace wxl::modern::adt
                     o.u32(newOfs);                              // ofsAlpha into the re-packed MCAL
                     o.u32(ground);                              // GroundEffectTexture id
                 }
-                nLayer = layers > 4 ? 4 : layers;
+                nLayer = keep;
             }
 
             // MCRF = MCRD (doodad refs) ++ MCRW (wmo refs).
@@ -348,7 +344,6 @@ namespace wxl::modern::adt
             o.patch32(sizePos, total - 8);
             mcin[id][0] = start;
             mcin[id][1] = total;
-            return rawLayers;
         }
 
         // A source obj0 may reference placed models by FileDataID in the placement entry's nameId, with no
@@ -522,15 +517,12 @@ namespace wxl::modern::adt
         if (find(rb, rl, MH2O, d, s)) { std::vector<uint8_t> w = fixMh2o(rb+d, s); ofsMH2O = o.chunk(MH2O, w.data(), uint32_t(w.size())); }
 
         uint32_t mc[256][2];
-        int probeMaxLayers = 0, probeChunksOver4 = 0;
         for (int i = 0; i < 256; ++i)
         {
             uint32_t to=0,tsz=0,oo=0,osz=0;
             if (hasTex && i < tc) { to=tM[i][0]; tsz=tM[i][1]; }
             if (hasObj && i < oc) { oo=oM[i][0]; osz=oM[i][1]; }
-            int lc = buildMcnk(o, i, rb, rM[i][0], rM[i][1], tb, to, tsz, ob, oo, osz, mc);
-            if (lc > probeMaxLayers) probeMaxLayers = lc;
-            if (lc > 4) ++probeChunksOver4;
+            buildMcnk(o, i, rb, rM[i][0], rM[i][1], tb, to, tsz, ob, oo, osz, mc);
         }
 
         if (find(rb, rl, MFBO, d, s)) ofsMFBO = o.chunk(MFBO, rb+d, s);
@@ -574,11 +566,6 @@ namespace wxl::modern::adt
             o.patch32(mcinData + i*0x10 + 0x0, mc[i][0]);
             o.patch32(mcinData + i*0x10 + 0x4, mc[i][1]);
         }
-
-        // Probe: surface tiles whose terrain exceeds the native 4-layer cap.
-        if (probeChunksOver4 > 0)
-            wxl::core::log::Printf("adt-probe: %.*s  maxLayers=%d  chunks>4=%d/256",
-                static_cast<int>(name.size()), name.data(), probeMaxLayers, probeChunksOver4);
 
         // ATSC: trailing table of per-texture UV-scale exponents (only the scaled ones). The Client
         // navigates the tile via MHDR/MCIN offsets and never reads this trailing chunk; the DLL parses it,

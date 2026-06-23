@@ -29,10 +29,9 @@
 // layout. Free functions, span-based, concrete.
 namespace wxl::modern::adt
 {
-    // Merge split root + _tex0 + _obj0 into one monolithic Client tile. `name` is used only for the probe
-    // log that surfaces tiles exceeding the native 4-layer cap. `rc` resolves asset FileDataIDs to paths
-    // when the source references assets by id instead of a name table; pass a null resolver for sources
-    // that ship name tables (the legacy-name path needs none).
+    // Merge split root + _tex0 + _obj0 into one monolithic Client tile. `name` is used only for log lines.
+    // `rc` resolves asset FileDataIDs to paths when the source references assets by id instead of a name
+    // table; pass a null resolver for sources that ship name tables (the legacy-name path needs none).
     bool MergeSplitAdt(std::span<const uint8_t> root, std::span<const uint8_t> tex0,
                        std::span<const uint8_t> obj0, std::vector<uint8_t>& out, std::string_view name,
                        const ResolveCtx& rc);
