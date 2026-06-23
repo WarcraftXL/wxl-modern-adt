@@ -68,6 +68,13 @@ namespace
         return s;
     }
 
+    // FileDataID -> path adapter for the merge: routes to the host resolver (the DB2 path tables a module
+    // registers). Cold; called once per unresolved texture/model/map-object reference.
+    bool ResolveThunk(void* /*user*/, uint32_t fileDataId, std::string& outPath)
+    {
+        return wxl::host::ResolveFdid(fileDataId, outPath);
+    }
+
     // Merge a split source terrain tile into one monolithic Client tile. Returns false (serve raw) for a
     // tile with no split siblings, or one whose merge does not apply.
     bool TransformAdt(std::string_view name, std::span<const uint8_t> raw, std::vector<uint8_t>& out)
@@ -87,7 +94,7 @@ namespace
         if (!hasTex && !hasObj) return false; // monolithic native tile: serve root unchanged
 
 
-        madt::ResolveCtx rc{};
+        madt::ResolveCtx rc{ &ResolveThunk, nullptr };
         const bool ok = madt::MergeSplitAdt(raw, tex0, obj0, out, name, rc);
         if (!ok)
             wxl::core::log::Printf("modern-adt: merge declined for %.*s", int(name.size()), name.data());
