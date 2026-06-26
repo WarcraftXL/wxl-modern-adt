@@ -119,8 +119,7 @@ namespace wxl::modern::adt
 
         uint16_t mapLiquidType(uint16_t id)
         {
-            if (id <= 100)
-                return id;
+            // Known modern liquid ids -> the matching Client liquid category (these Client ids exist).
             switch (id)
             {
                 case 101: case 321: case 324: case 350: case 412:
@@ -133,8 +132,12 @@ namespace wxl::modern::adt
                 case 586:
                     return 4;  // slime
                 default:
-                    return 5;  // water
+                    break;
             }
+            // The Client liquid table is sparse: only the basic ids (1..21) are reliably present. Any other
+            // id, including a modern id that falls in a gap of that table, has no row and faults a Client
+            // liquid lookup that omits the null guard, so everything outside the basic range becomes water.
+            return (id >= 1 && id <= 21) ? id : uint16_t(5);
         }
 
         std::vector<uint8_t> fixMh2o(const uint8_t* m, uint32_t n)
