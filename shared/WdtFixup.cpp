@@ -39,7 +39,7 @@ namespace wxl::modern::adt
         constexpr uint32_t kMainOffset     = 0x3C;          // first MAIN entry
         constexpr uint32_t kMainEntries    = 64u * 64u;     // 64x64 entries
         constexpr uint32_t kMainStride     = 8u;            // bytes per MAIN entry
-        constexpr uint32_t kMphdClientMask = 0x1F;          // bits the Client reads (drops 0x80, MAID, ...)
+        constexpr uint32_t kMphdClientMask = 0x0F;          // bits the Client reads: global-WMO, MCCV, big-alpha, sorted-refs
         constexpr uint32_t kMphdBigAlpha   = 0x4;           // map-wide 8-bit alpha selector
         constexpr uint8_t  kMainHasAdt     = 0x1;           // MAIN entry has-adt bit
     }
