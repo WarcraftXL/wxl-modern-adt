@@ -16,6 +16,8 @@
 
 #include "AdtMerge.hpp"
 
+#include "AdtExtraLayers.hpp"
+#include "AdtTexHeight.hpp"
 #include "AdtTexScale.hpp"
 #include "core/Logger.hpp"
 
@@ -27,8 +29,9 @@
 // Source terrain tiles are split into root + _tex0 + _obj0 (+ further siblings); the Client reads ONE
 // monolithic .adt (MVER|MHDR|MCIN[256]|map chunks|MCNK[256]). The merge runs on the bytes the host already
 // read: root + the two siblings come in as spans, the assembled tile goes out. Source per-MCNK data is
-// kept as far as the Client can consume it; the few features it still caps (texture layers > 4) are
-// clamped. The transform is DATA-GATED (chunk presence / field values), so one path serves every source.
+// kept as far as the Client can consume it. Texture layers beyond the Client's 4-slot cap are moved to
+// the trailing ATL2 table (name + flags + re-packed alpha per chunk) for the DLL's second-pass renderer.
+// The transform is DATA-GATED (chunk presence / field values), so one path serves every source.
 namespace wxl::modern::adt
 {
     namespace
@@ -222,12 +225,19 @@ namespace wxl::modern::adt
             const size_t base = out.size();
             out.resize(base + 2048);
             uint8_t* dst = out.data() + base;
-            for (uint32_t i = 0; i < 2048; ++i)                                   // pack two 8-bit texels -> one byte (a low nibble, b high)
-                dst[i] = uint8_t((tmp[i*2] >> 4) | ((tmp[i*2+1] >> 4) << 4));
+            // Pack two 8-bit texels -> one byte (first texel low nibble). The Client expands a nibble as
+            // n*17, so the exact inverse is round(v/17) = (v+8)/17; a plain v>>4 doubles the step error.
+            for (uint32_t i = 0; i < 2048; ++i)
+                dst[i] = uint8_t(((tmp[i*2] + 8) / 17) | (((tmp[i*2+1] + 8) / 17) << 4));
         }
 
+        // Layers 5..8 of a chunk, collected during the MCNK build for the trailing ATL2 table. The
+        // texture is recorded by MCLY textureId; the caller maps it to a name once MTEX is known.
+        struct RawExtraLayer { uint32_t textureId, flags, ground; std::vector<uint8_t> alpha; };
+        struct RawExtraChunk { int id; std::vector<uint8_t> shadow; std::vector<RawExtraLayer> layers; };
+
         // Assemble one monolithic MCNK from the three split pieces; fill mcin[id] with its file offset + size.
-        void buildMcnk(Out& o, int id,  const uint8_t* rb, uint32_t rOff, uint32_t rLen, const uint8_t* tb, uint32_t tOff, uint32_t tLen, const uint8_t* ob, uint32_t oOff, uint32_t oLen, uint32_t mcin[256][2])
+        void buildMcnk(Out& o, int id,  const uint8_t* rb, uint32_t rOff, uint32_t rLen, const uint8_t* tb, uint32_t tOff, uint32_t tLen, const uint8_t* ob, uint32_t oOff, uint32_t oLen, uint32_t mcin[256][2], std::vector<RawExtraChunk>& extras)
         {
             const uint32_t start = o.tell();
             o.u32(MCNK);
@@ -286,6 +296,39 @@ namespace wxl::modern::adt
                     o.u32(ground);                              // GroundEffectTexture id
                 }
                 nLayer = keep;
+
+                // Layers 5..8: collect for the trailing ATL2 table instead of dropping them. A layer
+                // without its own alpha map covers fully (0xFF). The chunk's MCSH rides along so the
+                // second pass can apply the same baked-shadow darkening as the native layers.
+                if (layers > 4)
+                {
+                    RawExtraChunk ec; ec.id = id;
+                    uint32_t shOff = 0, shLen = 0;
+                    if (sub(tb, tOff, tLen, MCSH, shOff, shLen) && shLen >= 512)
+                        ec.shadow.assign(tb + shOff, tb + shOff + 512);
+                    const int last = layers > 8 ? 8 : layers;
+                    for (int i = 4; i < last; ++i)
+                    {
+                        const uint8_t* L = tb + d + i*0x10;
+                        const uint32_t flags = rd32(L+0x04);
+                        RawExtraLayer el;
+                        el.textureId = rd32(L+0x00);
+                        el.flags     = (flags & 0x7FF) & ~0x200u;
+                        el.ground    = rd32(L+0x0C);
+                        if ((flags & 0x100) && mcalBase)
+                        {
+                            const uint32_t srcOfs  = rd32(L+0x08);
+                            const uint32_t nextOfs = (i+1 < layers) ? rd32(tb + d + (i+1)*0x10 + 0x08) : mcalSz;
+                            const uint32_t srcLen  = (srcOfs <= mcalSz)
+                                ? ((nextOfs > srcOfs && nextOfs <= mcalSz) ? nextOfs - srcOfs : mcalSz - srcOfs) : 0;
+                            decodeAlpha2048(mcalBase + srcOfs, srcLen, (flags & 0x200) != 0, el.alpha);
+                        }
+                        else
+                            el.alpha.assign(kAlphaBytes, 0xFF);
+                        ec.layers.push_back(std::move(el));
+                    }
+                    extras.push_back(std::move(ec));
+                }
             }
 
             // MCRF = MCRD (doodad refs) ++ MCRW (wmo refs).
@@ -314,11 +357,11 @@ namespace wxl::modern::adt
             uint64_t hiHoles = (flags & 0x10000) ? rd64(rh + 0x14) : 0;
             uint16_t loHoles = hiHoles ? holesHiToLo(hiHoles) : rd16(rh + 0x3C);
 
-            // Clear do_not_fix_alpha_map (0x8000): the tile is served 4-bit (MPHD big_alpha clear, matching
-            // the native tiles the map mixes in), the stock Client small-alpha path. The unpack leaves read a
-            // full 64x64 4-bit map regardless of this flag, so the clean stock combo is big_alpha-clear; keep
-            // only the low 16 bits the Client reads.
-            o.patch32(hdrPos + 0x00, (flags & 0xFFFF) & ~0x8000u);
+            // Set do_not_fix_alpha_map (0x8000): the re-packed MCAL (and the verbatim MCSH) carry real
+            // 64x64 data. With the flag clear the Client's 4-bit unpack reads them as 63x63 and synthesizes
+            // the last row/column by duplicating row/col 62, which discards the authored edge texels and
+            // draws a visible blend seam along every chunk border. Keep only the low 16 bits the Client reads.
+            o.patch32(hdrPos + 0x00, (flags & 0xFFFF) | 0x8000u);
             o.patch32(hdrPos + 0x04, uint32_t(id % 16));
             o.patch32(hdrPos + 0x08, uint32_t(id / 16));
             o.patch32(hdrPos + 0x0C, uint32_t(nLayer));
@@ -436,13 +479,16 @@ namespace wxl::modern::adt
         // Parallel to texNames: source height-blend params (MTXP heightScale/heightOffset); defaults 0/1.
         std::vector<float>       texHeightScale;
         std::vector<float>       texHeightOffset;
+        // Parallel to texNames: resolved height-texture (_h) path from MHID; empty when the source has none.
+        std::vector<std::string> texHeightName;
         auto lower = [](std::string s) { for (char& c : s) c = (c == '/') ? '\\' : char(tolower((unsigned char)c)); return s; };
 
         // MTEX: name-table tiles carry a texture-name table; FDID tiles reference textures by FileDataID
         // (MDID) and have no MTEX. When MTEX is absent, resolve each MDID id to a path and synthesize the
-        // MTEX blob in id order, so MCLY.textureId stays a valid 0-based index. Height textures (MHID) have
-        // no terrain path on the Client and are dropped. Without this the Client indexes an empty name
-        // table -> crash.
+        // MTEX blob in id order, so MCLY.textureId stays a valid 0-based index. Height textures (MHID)
+        // have no terrain path on the Client; their resolved paths ride the trailing ATHB table for the
+        // DLL height-blend feature. Without the MTEX synthesis the Client indexes an empty name table
+        // -> crash.
         if (hasTex && find(tb, tl, MTEX, d, s) && s > 0)
         {
             ofsMTEX = o.chunk(MTEX, tb+d, s);
@@ -470,6 +516,21 @@ namespace wxl::modern::adt
             nTexture = int(count);
             wxl::core::log::Printf("adt: %.*s MDID->MTEX %u textures (resolved=%u fallback=%u)",
                 int(name.size()), name.data(), count, resolved, fallback);
+
+            // MHID: height-texture FDIDs, parallel to MDID. Resolved paths feed the ATHB table only.
+            uint32_t hd2, hs2;
+            if (find(tb, tl, MHID, hd2, hs2))
+            {
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    std::string path;
+                    const uint32_t fdid = (i*4 + 4 <= hs2) ? rd32(tb + hd2 + i*4) : 0;
+                    if (fdid && rc.resolve && rc.resolve(rc.user, fdid, path) && !path.empty())
+                        texHeightName.push_back(lower(path));
+                    else
+                        texHeightName.push_back(std::string());
+                }
+            }
         }
         else ofsMTEX = o.chunk(MTEX, nullptr, 0);
 
@@ -520,12 +581,13 @@ namespace wxl::modern::adt
         if (find(rb, rl, MH2O, d, s)) { std::vector<uint8_t> w = fixMh2o(rb+d, s); ofsMH2O = o.chunk(MH2O, w.data(), uint32_t(w.size())); }
 
         uint32_t mc[256][2];
+        std::vector<RawExtraChunk> extras;
         for (int i = 0; i < 256; ++i)
         {
             uint32_t to=0,tsz=0,oo=0,osz=0;
             if (hasTex && i < tc) { to=tM[i][0]; tsz=tM[i][1]; }
             if (hasObj && i < oc) { oo=oM[i][0]; osz=oM[i][1]; }
-            buildMcnk(o, i, rb, rM[i][0], rM[i][1], tb, to, tsz, ob, oo, osz, mc);
+            buildMcnk(o, i, rb, rM[i][0], rM[i][1], tb, to, tsz, ob, oo, osz, mc, extras);
         }
 
         if (find(rb, rl, MFBO, d, s)) ofsMFBO = o.chunk(MFBO, rb+d, s);
@@ -534,14 +596,17 @@ namespace wxl::modern::adt
         {
             uint32_t md, ms, pd, ps;
             auto rdf = [](const uint8_t* p) { float v; std::memcpy(&v, p, 4); return v; };
-            if (hasTex && find(tb, tl, MTXF, md, ms)) {
-                // MTXF carries flags only (no height params): scale from bits 4-7, height defaults 0/1.
-                ofsMTXF = o.tell(); o.u32(MTXF); o.u32(ms);
-                for (uint32_t k=0;k+4<=ms;k+=4) { const uint32_t f = rd32(tb+md+k); o.u32(f & 0x1); texScaleExp.push_back(uint8_t((f >> 4) & 0xF)); texHeightScale.push_back(0.0f); texHeightOffset.push_back(1.0f); }
-            } else if (hasTex && find(tb, tl, MTXP, pd, ps)) {
+            // MTXP first: it is the superset (MTXF flags + height params) and is authoritative when a
+            // tile ships both chunks; reading MTXF first dropped the tile's height params AND its scale
+            // nibbles (modern tiles carry the real values in MTXP, the sibling MTXF is often zeroed).
+            if (hasTex && find(tb, tl, MTXP, pd, ps)) {
                 // MTXP per-texture 0x10: flags u32 @+0, heightScale f @+4, heightOffset f @+8. Synthesize MTXF.
                 uint32_t nn = ps/0x10; ofsMTXF = o.tell(); o.u32(MTXF); o.u32(nn*4);
                 for (uint32_t k=0;k<nn;++k) { const uint32_t f = rd32(tb+pd+k*0x10); o.u32(f & 0x1); texScaleExp.push_back(uint8_t((f >> 4) & 0xF)); texHeightScale.push_back(rdf(tb+pd+k*0x10+4)); texHeightOffset.push_back(rdf(tb+pd+k*0x10+8)); }
+            } else if (hasTex && find(tb, tl, MTXF, md, ms)) {
+                // MTXF carries flags only (no height params): scale from bits 4-7, height defaults 0/1.
+                ofsMTXF = o.tell(); o.u32(MTXF); o.u32(ms);
+                for (uint32_t k=0;k+4<=ms;k+=4) { const uint32_t f = rd32(tb+md+k); o.u32(f & 0x1); texScaleExp.push_back(uint8_t((f >> 4) & 0xF)); texHeightScale.push_back(0.0f); texHeightOffset.push_back(1.0f); }
             } else {
                 ofsMTXF = o.tell(); o.u32(MTXF); o.u32(uint32_t(nTexture)*4);
                 for (int k=0;k<nTexture;++k) { o.u32(0); texHeightScale.push_back(0.0f); texHeightOffset.push_back(1.0f); }
@@ -586,6 +651,69 @@ namespace wxl::modern::adt
                 o.chunk(kATSC, payload.data(), uint32_t(payload.size()));
                 wxl::core::log::Printf("adt: %.*s ATSC %u scaled textures",
                     int(name.size()), name.data(), uint32_t(scales.size()));
+            }
+        }
+
+        // ATHB: trailing table of per-texture height-blend inputs (MTXP heightScale/heightOffset +
+        // resolved MHID height-texture path). Same trailing-chunk contract as ATSC: invisible to the
+        // native loader, parsed by the DLL. An entry is emitted only when the texture actually carries
+        // height data (a height texture, or a non-default scale).
+        {
+            std::vector<TexHeightEntry> heights;
+            for (size_t k = 0; k < texNames.size(); ++k)
+            {
+                const float scale  = k < texHeightScale.size()  ? texHeightScale[k]  : 0.0f;
+                const float offset = k < texHeightOffset.size() ? texHeightOffset[k] : 1.0f;
+                std::string hName  = k < texHeightName.size()   ? texHeightName[k]   : std::string();
+                if (hName.empty() && scale == 0.0f)
+                    continue;
+                heights.push_back({ scale, offset, texNames[k], std::move(hName) });
+            }
+            if (!heights.empty())
+            {
+                std::vector<uint8_t> payload;
+                SerializeTexHeights(heights, payload);
+                o.chunk(kATHB, payload.data(), uint32_t(payload.size()));
+                wxl::core::log::Printf("adt: %.*s ATHB %u height-blend textures",
+                    int(name.size()), name.data(), uint32_t(heights.size()));
+            }
+        }
+
+        // ATL2: trailing table of the per-chunk texture layers beyond the Client's 4-slot cap
+        // (diffuse name + flags + ground-effect id + native-form alpha map). Same trailing-chunk
+        // contract as ATSC/ATHB: invisible to the native loader, parsed by the DLL, rendered as a
+        // second blended draw of the chunk.
+        if (!extras.empty())
+        {
+            std::vector<ExtraLayerChunk> table;
+            uint32_t layerTotal = 0;
+            for (RawExtraChunk& ec : extras)
+            {
+                ExtraLayerChunk c;
+                c.chunkIndex = uint16_t(ec.id);
+                c.shadow     = std::move(ec.shadow);
+                for (RawExtraLayer& el : ec.layers)
+                {
+                    ExtraLayer l;
+                    l.name = el.textureId < texNames.size() ? texNames[el.textureId] : std::string();
+                    if (l.name.empty())
+                        continue;
+                    l.flags        = el.flags;
+                    l.groundEffect = el.ground;
+                    l.alpha        = std::move(el.alpha);
+                    c.layers.push_back(std::move(l));
+                    ++layerTotal;
+                }
+                if (!c.layers.empty())
+                    table.push_back(std::move(c));
+            }
+            if (!table.empty())
+            {
+                std::vector<uint8_t> payload;
+                SerializeExtraLayers(table, payload);
+                o.chunk(kATL2, payload.data(), uint32_t(payload.size()));
+                wxl::core::log::Printf("adt: %.*s ATL2 %u chunks, %u extra layers",
+                    int(name.size()), name.data(), uint32_t(table.size()), layerTotal);
             }
         }
 
